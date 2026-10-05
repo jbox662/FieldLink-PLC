@@ -6,6 +6,12 @@ Requires **Python 3.9+**. On Windows also run `py -3 -m pip install cryptography
 
 Do not expose the HTTPS API on the public internet.
 
+## Direct iPhone-to-PLC bench path
+
+For an unknown PLC on a **direct cable** where the iPhone must remain wired and no switch or Wi-Fi discovery is allowed, use a two-NIC gateway computer: one NIC directly to the iPhone and one NIC directly to the PLC. Keep the NICs unbridged and do not enable NAT or forwarding between them.
+
+Follow [DIRECT-CABLE-SETUP.md](DIRECT-CABLE-SETUP.md) for the topology, static UI-link addresses, and exact Windows/Linux launch commands. The legacy single-NIC/Wi-Fi walkthrough below is not the unknown-PLC direct-cable workflow.
+
 ## Windows PC
 
 1. Copy the `gateway` folder onto the PC.

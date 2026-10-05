@@ -99,7 +99,9 @@ struct GatewayView: View {
     private var visibleCapabilities: [String] {
         if model.gatewayInfo?.identifier == "USB-C Ethernet" {
             return [
-                "EtherNet/IP ListIdentity broadcast on USB-C Ethernet (any subnet on the wire)",
+                "Read-only EtherNet/IP ListIdentity broadcast after Apple approves and provisions Multicast Networking",
+                "Known-address EtherNet/IP traffic can stay pinned to USB-C Ethernet",
+                "Unknown/no-IP and raw-L2 PLC discovery requires a FieldLink Gateway",
                 "Read-only identity (no address writes from the phone)",
                 "Local commissioning activity log"
             ]
@@ -134,15 +136,36 @@ struct DiscoveryDebugView: View {
                     LabeledContent("Link", value: report.linkDescription.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "· ", with: ""))
                     LabeledContent("Captured", value: report.capturedAt.formatted(date: .omitted, time: .standard))
                 }
+                Section("Discovery capability") {
+                    LabeledContent("Multicast capability", value: report.multicastEntitlementPresent ? "Present in signed build" : "Unavailable in signed build")
+                    if let blockedReason = report.blockedReason {
+                        Text(blockedReason)
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                }
                 Section("UDP 44818") {
                     LabeledContent("Unicast sent", value: "\(report.unicastsSent)")
                     LabeledContent("Broadcast sent", value: "\(report.broadcastsSent)")
                     LabeledContent("Send failures", value: "\(report.sendFailures)")
                     LabeledContent("Datagrams received", value: "\(report.datagramsReceived)")
+                    if let sourcePort = report.sourcePort {
+                        LabeledContent("Source port", value: "\(sourcePort) (ephemeral)")
+                    }
+                    if !report.broadcastTargets.isEmpty {
+                        LabeledContent("Targets", value: report.broadcastTargets.joined(separator: ", "))
+                    }
                     if let error = report.lastSendError {
                         Text(error)
                             .font(.caption)
                             .foregroundStyle(.red)
+                    }
+                    if !report.socketSetupErrors.isEmpty {
+                        ForEach(report.socketSetupErrors, id: \.self) { error in
+                            Text(error)
+                                .font(.caption)
+                                .foregroundStyle(.red)
+                        }
                     }
                 }
                 Section("Devices parsed") {
@@ -157,7 +180,7 @@ struct DiscoveryDebugView: View {
                 }
                 Section("Received packets") {
                     if report.packets.isEmpty {
-                        Text("No replies came back. If send counts are above zero, the phone transmitted. If recv stays 0, the PLC did not answer ListIdentity on this cable.")
+                        Text("No EtherNet/IP identity reply was received. This is inconclusive: the PLC may have no IP, use another protocol, be silent, or have a link/configuration problem.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     } else {
