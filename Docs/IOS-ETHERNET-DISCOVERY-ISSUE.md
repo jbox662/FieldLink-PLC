@@ -4,6 +4,8 @@
 **App:** FieldLink PLC (`com.johnnybox.fieldlinkplc`, team `6MGV2KJVCV`)  
 **Goal:** Match [TW Controls SIM-IPE](https://twcontrols.com/plc-trainers-all/p/sim-ipe) behavior: find EtherNet/IP devices on a live Ethernet cable **without the phone being on the same IP/subnet**, then read identity.
 
+> **Implementation update:** This file preserves the original bench evidence. The iPhone scanner no longer performs the broad off-subnet unicast sweep described below. It now stops with an explicit diagnostic when the signed app lacks Apple-approved Multicast Networking, and the post-approval path uses only interface-bound, bounded broadcast probes. The immediate unknown/no-IP direct-cable workflow is documented in [`gateway/DIRECT-CABLE-SETUP.md`](../gateway/DIRECT-CABLE-SETUP.md).
+
 This brief is for another engineer/agent (Manus). Please propose a **working iOS approach** (or a hard no with Apple-documented reasons) for discovery on a **direct iPhone USB-C Ethernet ↔ PLC** cable.
 
 ---

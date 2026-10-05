@@ -25,7 +25,7 @@
     <key>ITSAppUsesNonExemptEncryption</key>
     <false/>
     <key>NSLocalNetworkUsageDescription</key>
-    <string>FieldLink PLC uses USB-C Ethernet to find EtherNet/IP devices on the same cable/switch, including devices whose IP is not on this phone’s subnet. Allow Local Network or discovery cannot send UDP 44818. Wi-Fi is not used.</string>
+    <string>FieldLink PLC uses USB-C Ethernet to communicate with a FieldLink Gateway and, in builds approved for multicast networking, discover responsive EtherNet/IP devices on the directly attached local network. Wi-Fi is not used for PLC discovery.</string>
     <key>NSBonjourServices</key>
     <array>
         <string>_fieldlink-gateway._tcp</string>

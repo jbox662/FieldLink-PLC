@@ -14,7 +14,7 @@ struct GatewaySessionView: View {
     var body: some View {
         Form {
             Section("Live discovery") {
-                Text("Plug a USB-C Ethernet adapter into this iPhone and put it on the same Ethernet segment as the PLCs. Discover broadcasts EtherNet/IP ListIdentity on that port only — devices do not need to match this phone’s subnet. Wi-Fi is not used.")
+                Text("Plug a USB-C Ethernet adapter into this iPhone for read-only EtherNet/IP work. Unknown-IP broadcast discovery runs only after Apple approves and provisions Multicast Networking for this signed build. Wi-Fi is never used for PLC discovery.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                 Button("Use USB-C Ethernet") {

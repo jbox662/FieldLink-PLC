@@ -2,6 +2,7 @@ import CryptoKit
 import Darwin
 import Foundation
 import Network
+import Security
 
 /// Discovers real EtherNet/IP devices from this iPhone’s USB-C Ethernet adapter.
 /// Wi-Fi is never used. Address writes stay on a physical FieldLink Gateway.
@@ -51,11 +52,37 @@ actor LocalNetworkGatewayClient: GatewayClient {
         switch await IPv4Interface.plantEthernet() {
         case let .ready(network):
             interfaceSummary = "\(network.address) / \(network.prefixLength)"
-            let found = try await Task.detached(priority: .userInitiated) {
-                try EtherNetIPScanner.scan(interface: network)
+            guard MulticastNetworkingCapability.isPresent else {
+                let blocked = EtherNetIPScanner.blockedResult(interface: network)
+                devices = []
+                lastDebug = blocked.debugReport
+                auditTrail.insert(
+                    CommissioningEvent(
+                        kind: .discoveryCompleted,
+                        detail: blocked.summary,
+                        successful: false
+                    ),
+                    at: 0
+                )
+                throw GatewayClientError.broadcastCapabilityUnavailable
+            }
+            lastDebug = nil
+            let found = await Task.detached(priority: .userInitiated) {
+                EtherNetIPScanner.scan(interface: network)
             }.value
             devices = found.devices
             lastDebug = found.debugReport
+            if let socketError = found.socketSetupErrors.first {
+                auditTrail.insert(
+                    CommissioningEvent(
+                        kind: .discoveryCompleted,
+                        detail: found.summary,
+                        successful: false
+                    ),
+                    at: 0
+                )
+                throw GatewayClientError.gatewayFault(socketError)
+            }
             auditTrail.insert(
                 CommissioningEvent(
                     kind: .discoveryCompleted,
@@ -219,8 +246,16 @@ enum EtherNetIPScanner {
         var lastSendError: String?
         var interface: IPv4Interface
         var packets: [DiscoveryDebugPacket] = []
+        var sourcePort: UInt16? = nil
+        var broadcastTargets: [String] = []
+        var socketSetupErrors: [String] = []
+        var blockedReason: String? = nil
+        var multicastEntitlementPresent = true
 
         var summary: String {
+            if let blockedReason {
+                return "EtherNet/IP discovery on \(interface.name) is blocked. \(blockedReason) Wi-Fi was not used."
+            }
             var parts = [
                 "EtherNet/IP ListIdentity on \(interface.name) \(interface.address)/\(interface.prefixLength)\(interface.linkDescription)",
                 "found \(devices.count) device(s)",
@@ -228,11 +263,20 @@ enum EtherNetIPScanner {
                 "broadcasts \(broadcastsSent)",
                 "recv \(datagramsReceived)"
             ]
+            if let sourcePort {
+                parts.append("UDP source port \(sourcePort)")
+            }
+            if !broadcastTargets.isEmpty {
+                parts.append("targets \(broadcastTargets.joined(separator: ", "))")
+            }
             if sendFailures > 0 {
                 parts.append("send failures \(sendFailures)\(lastSendError.map { " (\($0))" } ?? "")")
             }
+            if !socketSetupErrors.isEmpty {
+                parts.append("socket setup errors \(socketSetupErrors.joined(separator: " | "))")
+            }
             if datagramsReceived == 0 {
-                parts.append("No UDP 44818 replies. If the PLC has no IP yet it will not answer ListIdentity. Allow Local Network in Settings → FieldLink PLC.")
+                parts.append("No EtherNet/IP identity reply. Result is inconclusive: the PLC may have no IP, use another protocol, be silent, or have a link/configuration problem.")
             }
             parts.append("Wi-Fi was not used.")
             return parts.joined(separator: ". ")
@@ -251,45 +295,36 @@ enum EtherNetIPScanner {
                 datagramsReceived: datagramsReceived,
                 lastSendError: lastSendError,
                 packets: packets,
-                deviceNames: devices.map { "\($0.name) \($0.displayedIPAddress)" }
+                deviceNames: devices.map { "\($0.name) \($0.displayedIPAddress)" },
+                sourcePort: sourcePort,
+                broadcastTargets: broadcastTargets,
+                multicastEntitlementPresent: multicastEntitlementPresent,
+                socketSetupErrors: socketSetupErrors,
+                blockedReason: blockedReason
             )
         }
     }
 
-    static func scan(interface: IPv4Interface) throws -> Result {
-        let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
-        guard fd >= 0 else {
-            throw GatewayClientError.gatewayFault("Unable to open a UDP socket for EtherNet/IP discovery.")
-        }
-        defer { close(fd) }
+    static func blockedResult(interface: IPv4Interface) -> Result {
+        Result(
+            devices: [],
+            unicastsSent: 0,
+            broadcastsSent: 0,
+            sendFailures: 0,
+            datagramsReceived: 0,
+            lastSendError: nil,
+            interface: interface,
+            multicastEntitlementPresent: false,
+            blockedReason: "This signed build does not include Apple’s approved Multicast Networking capability, so the app did not attempt UDP broadcast. Use a known IP after adding that feature, or use a FieldLink Gateway for unknown/no-IP devices."
+        )
+    }
 
-        var broadcast: Int32 = 1
-        _ = setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &broadcast, socklen_t(MemoryLayout<Int32>.size))
-        var reuse: Int32 = 1
-        _ = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
-        var timeout = timeval(tv_sec: 0, tv_usec: 200_000)
-        _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
-
-        var bindAddress = sockaddr_in()
-        bindAddress.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-        bindAddress.sin_family = sa_family_t(AF_INET)
-        bindAddress.sin_port = EtherNetIPListIdentity.udpPort.bigEndian
-        bindAddress.sin_addr.s_addr = inet_addr(interface.address)
-        let bindResult = withUnsafePointer(to: &bindAddress) { pointer in
-            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
-                bind(fd, sockaddrPointer, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
+    static func scan(interface: IPv4Interface) -> Result {
+        let directedBroadcast = interface.broadcastAddress
+        var targets = ["255.255.255.255"]
+        if directedBroadcast != "255.255.255.255" {
+            targets.append(directedBroadcast)
         }
-        guard bindResult == 0 else {
-            throw GatewayClientError.gatewayFault("Unable to bind UDP 44818 on USB-C Ethernet (\(interface.name) \(interface.address)).")
-        }
-
-        var interfaceIndex = if_nametoindex(interface.name)
-        if interfaceIndex != 0 {
-            _ = setsockopt(fd, IPPROTO_IP, IP_BOUND_IF, &interfaceIndex, socklen_t(MemoryLayout<UInt32>.size))
-        }
-
-        let request = [UInt8](EtherNetIPListIdentity.request)
         var stats = Result(
             devices: [],
             unicastsSent: 0,
@@ -297,8 +332,59 @@ enum EtherNetIPScanner {
             sendFailures: 0,
             datagramsReceived: 0,
             lastSendError: nil,
-            interface: interface
+            interface: interface,
+            broadcastTargets: targets
         )
+
+        func setupFailure(_ detail: String) -> Result {
+            stats.socketSetupErrors.append(detail)
+            stats.blockedReason = "The EtherNet/IP discovery socket could not be prepared."
+            return stats
+        }
+
+        let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        guard fd >= 0 else {
+            return setupFailure("Unable to open a UDP socket for EtherNet/IP discovery: \(String(cString: strerror(errno))).")
+        }
+        defer { close(fd) }
+
+        var broadcast: Int32 = 1
+        guard setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &broadcast, socklen_t(MemoryLayout<Int32>.size)) == 0 else {
+            return setupFailure("Unable to enable UDP broadcast: \(String(cString: strerror(errno))).")
+        }
+        var reuse: Int32 = 1
+        guard setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size)) == 0 else {
+            return setupFailure("Unable to configure the EtherNet/IP UDP socket: \(String(cString: strerror(errno))).")
+        }
+        var timeout = timeval(tv_sec: 0, tv_usec: 200_000)
+        guard setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size)) == 0 else {
+            return setupFailure("Unable to set the EtherNet/IP receive timeout: \(String(cString: strerror(errno))).")
+        }
+
+        var interfaceIndex = if_nametoindex(interface.name)
+        guard interfaceIndex != 0 else {
+            return setupFailure("Unable to resolve the USB-C Ethernet interface index for \(interface.name).")
+        }
+        guard setsockopt(fd, IPPROTO_IP, IP_BOUND_IF, &interfaceIndex, socklen_t(MemoryLayout<UInt32>.size)) == 0 else {
+            return setupFailure("Unable to bind EtherNet/IP discovery to \(interface.name): \(String(cString: strerror(errno))).")
+        }
+
+        var bindAddress = sockaddr_in()
+        bindAddress.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        bindAddress.sin_family = sa_family_t(AF_INET)
+        bindAddress.sin_port = 0
+        bindAddress.sin_addr.s_addr = INADDR_ANY
+        let bindResult = withUnsafePointer(to: &bindAddress) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                bind(fd, sockaddrPointer, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bindResult == 0 else {
+            return setupFailure("Unable to bind the EtherNet/IP UDP receive socket: \(String(cString: strerror(errno))).")
+        }
+        stats.sourcePort = localPort(fd: fd)
+
+        let request = [UInt8](EtherNetIPListIdentity.request)
 
         func send(_ host: String, isBroadcast: Bool) {
             let sent = sendPacket(fd: fd, bytes: request, host: host)
@@ -310,13 +396,11 @@ enum EtherNetIPScanner {
             }
         }
 
-        // Broadcast is the SIM-IPE-style path. iOS silently drops it without Apple's
-        // multicast entitlement, so also unicast-probe common industrial prefixes.
-        for host in ["255.255.255.255", interface.broadcastAddress] {
+        // This code path is called only after runtime verification that the signed
+        // iPhone build carries Apple's Multicast Networking capability. It performs
+        // bounded read-only discovery, never an address sweep.
+        for host in targets {
             send(host, isBroadcast: true)
-        }
-        for host in industrialProbeAddresses(excluding: interface.address) {
-            send(host, isBroadcast: false)
         }
 
         var discovered: [String: PLCDevice] = [:]
@@ -355,26 +439,6 @@ enum EtherNetIPScanner {
         return stats
     }
 
-    private static func industrialProbeAddresses(excluding selfIP: String) -> [String] {
-        let prefixes: [(UInt8, UInt8, UInt8)] = [
-            (192, 168, 0), (192, 168, 1), (192, 168, 2),
-            (192, 168, 10), (192, 168, 100),
-            (10, 0, 0), (10, 10, 10),
-            (172, 16, 0)
-        ]
-        var hosts: [String] = []
-        hosts.reserveCapacity(prefixes.count * 254)
-        for prefix in prefixes {
-            for host in 1 ... 254 {
-                let ip = "\(prefix.0).\(prefix.1).\(prefix.2).\(host)"
-                if ip != selfIP {
-                    hosts.append(ip)
-                }
-            }
-        }
-        return hosts
-    }
-
     private static func sendPacket(fd: Int32, bytes: [UInt8], host: String) -> Bool {
         var address = sockaddr_in()
         address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
@@ -389,6 +453,18 @@ enum EtherNetIPScanner {
             }
         }
         return result >= 0
+    }
+
+    private static func localPort(fd: Int32) -> UInt16? {
+        var address = sockaddr_in()
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let result = withUnsafeMutablePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                getsockname(fd, sockaddrPointer, &length)
+            }
+        }
+        guard result == 0 else { return nil }
+        return UInt16(bigEndian: address.sin_port)
     }
 }
 
@@ -567,6 +643,24 @@ enum LocalNetworkAuthorization {
         browser.start(queue: .global(qos: .userInitiated))
         try? await Task.sleep(nanoseconds: 400_000_000)
         browser.cancel()
+    }
+}
+
+/// Broadcast is allowed only when Apple has approved the managed capability for
+/// the actual App ID and that entitlement is present in the signed app. Keeping
+/// this check in the live client prevents a misleading "0 devices" result from
+/// an on-device build that cannot legally send or receive UDP broadcast.
+enum MulticastNetworkingCapability {
+    static var isPresent: Bool {
+        guard let task = SecTaskCreateFromSelf(kCFAllocatorDefault),
+              let value = SecTaskCopyValueForEntitlement(
+                task,
+                "com.apple.developer.networking.multicast" as CFString,
+                nil
+              ) else {
+            return false
+        }
+        return (value as? NSNumber)?.boolValue ?? false
     }
 }
 

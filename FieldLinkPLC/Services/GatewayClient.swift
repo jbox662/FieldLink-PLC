@@ -59,6 +59,7 @@ enum GatewayClientError: LocalizedError {
     case invalidResponse
     case noLocalNetwork
     case ethernetHasNoAddress(String)
+    case broadcastCapabilityUnavailable
 
     var errorDescription: String? {
         switch self {
@@ -76,6 +77,7 @@ enum GatewayClientError: LocalizedError {
         case .invalidResponse: "The gateway returned an unreadable response."
         case .noLocalNetwork: "This iPhone does not see a USB-C Ethernet adapter. Plug the adapter into the phone (not the Windows PC), then open Settings → Ethernet. If Ethernet is missing, the dongle is not talking Ethernet to iOS."
         case let .ethernetHasNoAddress(name): "USB-C Ethernet (\(name)) is plugged in but has no IPv4 address. Open Settings → Ethernet, set Configure IP to Manual, and give it an address on the PLC subnet — for example 192.168.1.50 / 255.255.255.0. Automatic will sit at none if the bench has no DHCP."
+        case .broadcastCapabilityUnavailable: "This signed build does not contain Apple’s approved Multicast Networking capability. It cannot run unknown-IP EtherNet/IP broadcast discovery. Enter a known PLC IP after adding that feature, or use the wired FieldLink Gateway for unknown/no-IP PLCs."
         }
     }
 }
@@ -118,6 +120,11 @@ struct DiscoveryDebugReport: Hashable, Sendable {
     var lastSendError: String?
     var packets: [DiscoveryDebugPacket]
     var deviceNames: [String]
+    var sourcePort: UInt16? = nil
+    var broadcastTargets: [String] = []
+    var multicastEntitlementPresent = false
+    var socketSetupErrors: [String] = []
+    var blockedReason: String? = nil
 
     var shareText: String {
         var lines = [
@@ -130,11 +137,28 @@ struct DiscoveryDebugReport: Hashable, Sendable {
             "Datagrams received: \(datagramsReceived)",
             "Devices: \(deviceNames.isEmpty ? "none" : deviceNames.joined(separator: ", "))"
         ]
+        lines.append("Multicast capability: \(multicastEntitlementPresent ? "present" : "not present")")
+        if let sourcePort {
+            lines.append("UDP source port: \(sourcePort)")
+        }
+        if !broadcastTargets.isEmpty {
+            lines.append("Broadcast targets: \(broadcastTargets.joined(separator: ", "))")
+        }
+        if let blockedReason {
+            lines.append("Discovery blocked: \(blockedReason)")
+        }
+        if !socketSetupErrors.isEmpty {
+            lines.append("Socket setup errors: \(socketSetupErrors.joined(separator: " | "))")
+        }
         if let lastSendError {
             lines.append("Last send error: \(lastSendError)")
         }
         if packets.isEmpty {
-            lines.append("No UDP replies were received on port 44818.")
+            if let sourcePort {
+                lines.append("No UDP replies were received on the discovery socket (source port \(sourcePort)); ListIdentity requests use destination port 44818.")
+            } else {
+                lines.append("No UDP replies were received on the discovery socket; ListIdentity requests use destination port 44818.")
+            }
         } else {
             lines.append("Received packets:")
             for packet in packets {

@@ -71,6 +71,9 @@ final class CommissioningViewModel: ObservableObject {
             discoveryDebug = await gateway.lastDiscoveryDebug()
         } catch {
             discoveryDebug = await gateway.lastDiscoveryDebug()
+            if let events = try? await gateway.fetchAuditTrail() {
+                self.events = events
+            }
             present(error, title: "Discovery failed")
         }
     }
