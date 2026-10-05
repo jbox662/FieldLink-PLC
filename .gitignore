@@ -1,0 +1,27 @@
+# Xcode / build
+build/
+DerivedData/
+*.xcarchive
+*.ipa
+*.dSYM
+xcuserdata/
+*.xcuserstate
+*.moved-aside
+*.hmap
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Gateway runtime identity (certs, pairing codes)
+.fieldlink-gateway/
+**/tls.key
+**/tls.der
+**/pairing-card.txt
+**/pairing.json
+**/audit.json
+__pycache__/
+*.pyc
+.venv/
+venv/
