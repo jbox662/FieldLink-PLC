@@ -10,7 +10,7 @@ enum CommissioningEventKind: String, Codable, Hashable {
     var symbol: String {
         switch self {
         case .gatewayConnected: "cable.connector"
-        case .discoveryCompleted: "radar"
+        case .discoveryCompleted: "antenna.radiowaves.left.and.right"
         case .addressAssigned: "arrow.left.arrow.right"
         case .staticEnabled: "lock.fill"
         case .validationCompleted: "checkmark.shield.fill"

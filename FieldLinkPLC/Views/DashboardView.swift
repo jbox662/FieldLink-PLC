@@ -68,7 +68,7 @@ struct DashboardView: View {
                     Label {
                         Text(model.isWorking ? "Working…" : "Discover devices")
                     } icon: {
-                        Image(systemName: "radar")
+                        Image(systemName: "antenna.radiowaves.left.and.right")
                     }
                         .frame(maxWidth: .infinity)
                 }

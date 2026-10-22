@@ -2,7 +2,10 @@ import CryptoKit
 import Darwin
 import Foundation
 import Network
+import os
 import Security
+
+private let discoveryLog = Logger(subsystem: "com.johnnybox.fieldlinkplc", category: "discovery")
 
 /// Discovers real EtherNet/IP devices from this iPhone’s USB-C Ethernet adapter.
 /// Wi-Fi is never used. Address writes stay on a physical FieldLink Gateway.
@@ -56,6 +59,7 @@ actor LocalNetworkGatewayClient: GatewayClient {
                 let blocked = EtherNetIPScanner.blockedResult(interface: network)
                 devices = []
                 lastDebug = blocked.debugReport
+                discoveryLog.error("Discovery blocked: \(blocked.summary, privacy: .public)")
                 auditTrail.insert(
                     CommissioningEvent(
                         kind: .discoveryCompleted,
@@ -67,11 +71,29 @@ actor LocalNetworkGatewayClient: GatewayClient {
                 throw GatewayClientError.broadcastCapabilityUnavailable
             }
             lastDebug = nil
+            let profileBroadcast = directedBroadcast(ip: profile.interfaceIPAddress, mask: profile.subnetMask)
+            let sameSubnet = profileBroadcast == network.broadcastAddress
+            let extraBroadcasts = sameSubnet ? [profileBroadcast] : []
+            let extraUnicasts = sameSubnet
+                ? subnetHosts(ip: profile.interfaceIPAddress, mask: profile.subnetMask, skipping: network.address)
+                : []
             let found = await Task.detached(priority: .userInitiated) {
-                EtherNetIPScanner.scan(interface: network)
+                EtherNetIPScanner.scan(
+                    interface: network,
+                    extraBroadcasts: extraBroadcasts,
+                    extraUnicasts: extraUnicasts
+                )
             }.value
             devices = found.devices
             lastDebug = found.debugReport
+            discoveryLog.info("\(found.summary, privacy: .public)")
+            if found.devices.isEmpty {
+                discoveryLog.info("No EtherNet/IP devices parsed")
+            } else {
+                for device in found.devices {
+                    discoveryLog.info("Found \(device.name, privacy: .public) \(device.displayedIPAddress, privacy: .public) vendor=\(device.vendor, privacy: .public)")
+                }
+            }
             if let socketError = found.socketSetupErrors.first {
                 auditTrail.insert(
                     CommissioningEvent(
@@ -128,6 +150,11 @@ enum EtherNetIPListIdentity {
         data[0] = 0x63
         data[1] = 0x00
         return data
+    }
+
+    static func isRequest(_ data: Data) -> Bool {
+        guard data.count == 24 else { return false }
+        return readUInt16LE(data, 0) == 0x0063 && readUInt16LE(data, 2) == 0
     }
 
     static func parse(response: Data, sourceAddress: String) -> PLCDevice? {
@@ -214,6 +241,7 @@ enum EtherNetIPListIdentity {
         switch id {
         case 1: "Rockwell Automation"
         case 11: "Bosch"
+        case 77: "HMS / Softing / PC adapter"
         case 48: "Eaton"
         case 168: "WAGO"
         case 343: "Omron"
@@ -256,13 +284,16 @@ enum EtherNetIPScanner {
             if let blockedReason {
                 return "EtherNet/IP discovery on \(interface.name) is blocked. \(blockedReason) Wi-Fi was not used."
             }
+            let eipCount = devices.filter { $0.discoveryProtocols.contains(.ethernetIP) }.count
+            let liveOnly = devices.count - eipCount
             var parts = [
                 "EtherNet/IP ListIdentity on \(interface.name) \(interface.address)/\(interface.prefixLength)\(interface.linkDescription)",
-                "found \(devices.count) device(s)",
+                "found \(eipCount) EtherNet/IP device(s)",
+                liveOnly > 0 ? "plus \(liveOnly) live IPv4 host(s)" : nil,
                 "unicast probes \(unicastsSent)",
                 "broadcasts \(broadcastsSent)",
                 "recv \(datagramsReceived)"
-            ]
+            ].compactMap { $0 }
             if let sourcePort {
                 parts.append("UDP source port \(sourcePort)")
             }
@@ -314,17 +345,24 @@ enum EtherNetIPScanner {
             datagramsReceived: 0,
             lastSendError: nil,
             interface: interface,
-            multicastEntitlementPresent: false,
-            blockedReason: "This signed build does not include Apple’s approved Multicast Networking capability, so the app did not attempt UDP broadcast. Use a known IP after adding that feature, or use a FieldLink Gateway for unknown/no-IP devices."
+            blockedReason: "This signed build does not include Apple’s approved Multicast Networking capability, so the app did not attempt UDP broadcast. Use a known IP after adding that feature, or use a FieldLink Gateway for unknown/no-IP devices.",
+            multicastEntitlementPresent: false
         )
     }
 
-    static func scan(interface: IPv4Interface) -> Result {
-        let directedBroadcast = interface.broadcastAddress
+    static func scan(
+        interface: IPv4Interface,
+        extraBroadcasts: [String] = [],
+        extraUnicasts: [String] = []
+    ) -> Result {
         var targets = ["255.255.255.255"]
-        if directedBroadcast != "255.255.255.255" {
-            targets.append(directedBroadcast)
+        if interface.prefixLength >= 24, interface.broadcastAddress != "255.255.255.255" {
+            targets.append(interface.broadcastAddress)
         }
+        for broadcast in extraBroadcasts where !targets.contains(broadcast) && broadcast != "0.0.0.0" {
+            targets.append(broadcast)
+        }
+
         var stats = Result(
             devices: [],
             unicastsSent: 0,
@@ -356,7 +394,9 @@ enum EtherNetIPScanner {
         guard setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size)) == 0 else {
             return setupFailure("Unable to configure the EtherNet/IP UDP socket: \(String(cString: strerror(errno))).")
         }
-        var timeout = timeval(tv_sec: 0, tv_usec: 200_000)
+        var receiveBuffer: Int32 = 256 * 1024
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &receiveBuffer, socklen_t(MemoryLayout<Int32>.size))
+        var timeout = timeval(tv_sec: 0, tv_usec: 150_000)
         guard setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size)) == 0 else {
             return setupFailure("Unable to set the EtherNet/IP receive timeout: \(String(cString: strerror(errno))).")
         }
@@ -369,59 +409,56 @@ enum EtherNetIPScanner {
             return setupFailure("Unable to bind EtherNet/IP discovery to \(interface.name): \(String(cString: strerror(errno))).")
         }
 
+        // Many EtherNet/IP stacks reply to UDP 44818, not the ephemeral source port.
         var bindAddress = sockaddr_in()
         bindAddress.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         bindAddress.sin_family = sa_family_t(AF_INET)
-        bindAddress.sin_port = 0
+        bindAddress.sin_port = EtherNetIPListIdentity.udpPort.bigEndian
         bindAddress.sin_addr.s_addr = INADDR_ANY
-        let bindResult = withUnsafePointer(to: &bindAddress) { pointer in
+        let bind44818 = withUnsafePointer(to: &bindAddress) { pointer in
             pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
                 bind(fd, sockaddrPointer, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
         }
-        guard bindResult == 0 else {
-            return setupFailure("Unable to bind the EtherNet/IP UDP receive socket: \(String(cString: strerror(errno))).")
+        if bind44818 != 0 {
+            bindAddress.sin_port = 0
+            let bindAny = withUnsafePointer(to: &bindAddress) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                    bind(fd, sockaddrPointer, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+            guard bindAny == 0 else {
+                return setupFailure("Unable to bind the EtherNet/IP UDP receive socket: \(String(cString: strerror(errno))).")
+            }
         }
         stats.sourcePort = localPort(fd: fd)
 
         let request = [UInt8](EtherNetIPListIdentity.request)
-
-        func send(_ host: String, isBroadcast: Bool) {
-            let sent = sendPacket(fd: fd, bytes: request, host: host)
-            if sent {
-                if isBroadcast { stats.broadcastsSent += 1 } else { stats.unicastsSent += 1 }
-            } else {
-                stats.sendFailures += 1
-                stats.lastSendError = "\(host): \(String(cString: strerror(errno)))"
-            }
-        }
-
-        // This code path is called only after runtime verification that the signed
-        // iPhone build carries Apple's Multicast Networking capability. It performs
-        // bounded read-only discovery, never an address sweep.
-        for host in targets {
-            send(host, isBroadcast: true)
-        }
-
         var discovered: [String: PLCDevice] = [:]
-        let deadline = Date().addingTimeInterval(4.0)
-        var buffer = [UInt8](repeating: 0, count: 2048)
-        while Date() < deadline {
+        var buffer = [UInt8](repeating: 0, count: 4096)
+
+        func collectReplies(wait: Bool) {
             var source = sockaddr_in()
             var sourceLength = socklen_t(MemoryLayout<sockaddr_in>.size)
+            let flags: Int32 = wait ? 0 : MSG_DONTWAIT
             let received = withUnsafeMutablePointer(to: &source) { pointer in
                 pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
-                    recvfrom(fd, &buffer, buffer.count, 0, sockaddrPointer, &sourceLength)
+                    recvfrom(fd, &buffer, buffer.count, flags, sockaddrPointer, &sourceLength)
                 }
             }
-            guard received > 0 else { continue }
-            stats.datagramsReceived += 1
+            guard received > 0 else { return }
             let sourceAddress = ipv4String(source)
             let sourcePort = UInt16(bigEndian: source.sin_port)
             let data = Data(buffer.prefix(Int(received)))
+            if sourceAddress == interface.address || EtherNetIPListIdentity.isRequest(data) {
+                return
+            }
+            stats.datagramsReceived += 1
             let device = EtherNetIPListIdentity.parse(response: data, sourceAddress: sourceAddress)
             if let device {
                 discovered[device.serialNumber + "|" + (device.ipAddress ?? sourceAddress)] = device
+            } else {
+                discoveryLog.info("Unparsed UDP \(received)B from \(sourceAddress, privacy: .public):\(sourcePort)")
             }
             if stats.packets.count < 64 {
                 stats.packets.append(
@@ -435,7 +472,62 @@ enum EtherNetIPScanner {
             }
         }
 
-        stats.devices = discovered.values.sorted { ($0.ipAddress ?? "") < ($1.ipAddress ?? "") }
+        func send(_ host: String, isBroadcast: Bool) {
+            let sent = sendPacket(fd: fd, bytes: request, host: host)
+            if sent {
+                if isBroadcast { stats.broadcastsSent += 1 } else { stats.unicastsSent += 1 }
+            } else {
+                stats.sendFailures += 1
+                stats.lastSendError = "\(host): \(String(cString: strerror(errno)))"
+            }
+        }
+
+        var unicastHosts = subnetHosts(ip: interface.address, mask: interface.netmask, skipping: interface.address)
+        for host in extraUnicasts where !unicastHosts.contains(host) && host != interface.address {
+            unicastHosts.append(host)
+        }
+        unicastHosts = unicastHosts.filter { isOnLink($0, interface: interface) }
+
+        for (index, host) in unicastHosts.enumerated() {
+            send(host, isBroadcast: false)
+            if index % 16 == 0 {
+                collectReplies(wait: false)
+            }
+        }
+
+        let deadline = Date().addingTimeInterval(5.0)
+        var nextBroadcast = Date()
+        while Date() < deadline {
+            if Date() >= nextBroadcast {
+                for host in targets {
+                    send(host, isBroadcast: true)
+                }
+                nextBroadcast = Date().addingTimeInterval(1.2)
+            }
+            collectReplies(wait: true)
+        }
+
+        let pingHosts = ICMPHostProbe.liveHosts(interface: interface, hosts: unicastHosts)
+        let tcpHosts = TCPHostProbe.liveHosts(interface: interface, hosts: unicastHosts)
+        let liveHosts = Set(pingHosts).union(tcpHosts)
+        discoveryLog.info("Host probe ICMP=\(pingHosts.count) TCP=\(tcpHosts.count) unique=\(liveHosts.count)")
+        for host in liveHosts.sorted() {
+            let alreadyFound = discovered.values.contains { $0.ipAddress == host }
+            guard !alreadyFound else { continue }
+            let identity = LiveHostIdentifier.identify(ip: host, interfaceIndex: interfaceIndex)
+            let device = liveIPv4Device(ip: host, identity: identity)
+            discovered[host] = device
+            discoveryLog.info(
+                "Live IPv4 \(host, privacy: .public) name=\(device.name, privacy: .public) \(device.product, privacy: .public)"
+            )
+        }
+
+        stats.devices = discovered.values.sorted { lhs, rhs in
+            let leftEIP = lhs.discoveryProtocols.contains(.ethernetIP)
+            let rightEIP = rhs.discoveryProtocols.contains(.ethernetIP)
+            if leftEIP != rightEIP { return leftEIP && !rightEIP }
+            return (lhs.ipAddress ?? "") < (rhs.ipAddress ?? "")
+        }
         return stats
     }
 
@@ -594,7 +686,7 @@ enum WiredEthernetMonitor {
             let monitor = NWPathMonitor()
             let state = EthernetNameCollector()
 
-            func finish() {
+            @Sendable func finish() {
                 guard let names = state.complete() else { return }
                 monitor.cancel()
                 continuation.resume(returning: names)
@@ -651,16 +743,46 @@ enum LocalNetworkAuthorization {
 /// this check in the live client prevents a misleading "0 devices" result from
 /// an on-device build that cannot legally send or receive UDP broadcast.
 enum MulticastNetworkingCapability {
+    private static let entitlement = "com.apple.developer.networking.multicast"
+
     static var isPresent: Bool {
-        guard let task = SecTaskCreateFromSelf(kCFAllocatorDefault),
-              let value = SecTaskCopyValueForEntitlement(
-                task,
-                "com.apple.developer.networking.multicast" as CFString,
-                nil
-              ) else {
-            return false
+        if let fromProcess = processEntitlement() {
+            return fromProcess
         }
-        return (value as? NSNumber)?.boolValue ?? false
+        return provisioningProfileEntitlements()?[entitlement] as? Bool ?? false
+    }
+
+    /// `SecTaskCreateFromSelf` exists in Security on iOS but is not in the Swift overlay.
+    private static func processEntitlement() -> Bool? {
+        let defaultHandle = UnsafeMutableRawPointer(bitPattern: -2)
+        guard let createSymbol = dlsym(defaultHandle, "SecTaskCreateFromSelf"),
+              let copySymbol = dlsym(defaultHandle, "SecTaskCopyValueForEntitlement") else {
+            return nil
+        }
+        typealias Create = @convention(c) (CFAllocator?) -> UnsafeRawPointer?
+        typealias Copy = @convention(c) (UnsafeRawPointer, CFString, UnsafeMutablePointer<UnsafeRawPointer?>?) -> Unmanaged<CFTypeRef>?
+        let create = unsafeBitCast(createSymbol, to: Create.self)
+        let copy = unsafeBitCast(copySymbol, to: Copy.self)
+        guard let task = create(kCFAllocatorDefault) else { return nil }
+        defer { Unmanaged<CFTypeRef>.fromOpaque(task).release() }
+        guard let value = copy(task, entitlement as CFString, nil) else { return false }
+        return (value.takeRetainedValue() as? NSNumber)?.boolValue ?? false
+    }
+
+    private static func provisioningProfileEntitlements() -> [String: Any]? {
+        guard let url = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision"),
+              let data = try? Data(contentsOf: url),
+              let ascii = String(data: data, encoding: .isoLatin1),
+              let xmlStart = ascii.range(of: "<?xml"),
+              let xmlEnd = ascii.range(of: "</plist>") else {
+            return nil
+        }
+        let xml = String(ascii[xmlStart.lowerBound...xmlEnd.upperBound])
+        guard let plistData = xml.data(using: .utf8),
+              let plist = try? PropertyListSerialization.propertyList(from: plistData, options: [], format: nil) as? [String: Any] else {
+            return nil
+        }
+        return plist["Entitlements"] as? [String: Any]
     }
 }
 
@@ -680,6 +802,405 @@ private func readUInt32BE(_ data: Data, _ offset: Int) -> UInt32 {
         | UInt32(data[offset + 1]) << 16
         | UInt32(data[offset + 2]) << 8
         | UInt32(data[offset + 3])
+}
+
+private func liveIPv4Device(ip: String, identity: LiveHostIdentity = LiveHostIdentity()) -> PLCDevice {
+    PLCDevice(
+        id: EtherNetIPListIdentity.stableID(serial: "ICMP", ip: ip),
+        name: identity.displayName(for: ip),
+        vendor: identity.vendor,
+        product: identity.product,
+        revision: identity.hostname ?? "",
+        serialNumber: ip,
+        macAddress: "Unknown",
+        ipAddress: ip,
+        subnetMask: nil,
+        gatewayAddress: nil,
+        discoveryProtocols: [.arp],
+        addressingState: .staticAddress,
+        linkStatus: .active,
+        lastSeen: Date()
+    )
+}
+
+struct LiveHostIdentity {
+    var hostname: String?
+    var openPorts: [UInt16] = []
+    var httpServer: String?
+    var httpTitle: String?
+
+    var vendor: String {
+        if openPorts.contains(44818) { return "CIP TCP (no UDP identity)" }
+        if openPorts.contains(502) { return "Modbus TCP" }
+        if openPorts.contains(9100) { return "Printer" }
+        if openPorts.contains(554) { return "RTSP camera" }
+        if openPorts.contains(445) { return "Windows / SMB" }
+        if openPorts.contains(80) || openPorts.contains(443) || openPorts.contains(8080) { return "HTTP device" }
+        if openPorts.contains(22) { return "SSH host" }
+        if hostname != nil { return "DNS name" }
+        return "Live IPv4"
+    }
+
+    var product: String {
+        var parts: [String] = []
+        if !openPorts.isEmpty {
+            parts.append("TCP \(openPorts.map(String.init).joined(separator: ", "))")
+        }
+        if let httpServer, !httpServer.isEmpty { parts.append(httpServer) }
+        if let httpTitle, !httpTitle.isEmpty, !LiveHostIdentity.isUselessTitle(httpTitle) {
+            parts.append(httpTitle)
+        }
+        if parts.isEmpty { parts.append("Reachable. No EtherNet/IP ListIdentity.") }
+        else { parts.append("No EtherNet/IP ListIdentity") }
+        return parts.joined(separator: " · ")
+    }
+
+    func displayName(for ip: String) -> String {
+        if let hostname {
+            let short = hostname.split(separator: ".").first.map(String.init) ?? hostname
+            if !short.isEmpty, short != ip { return short }
+        }
+        if let httpTitle, !httpTitle.isEmpty, !LiveHostIdentity.isUselessTitle(httpTitle) {
+            return httpTitle
+        }
+        if openPorts.contains(9100) { return "Printer" }
+        if openPorts.contains(554) { return "Camera" }
+        if openPorts.contains(502) { return "Modbus device" }
+        if openPorts.contains(44818) { return "EtherNet/IP TCP host" }
+        if openPorts.contains(445) { return "Windows host" }
+        if ip.hasSuffix(".1"), openPorts.contains(80) || openPorts.contains(443) { return "Router / gateway" }
+        if openPorts.contains(80) || openPorts.contains(443) { return "Web device" }
+        return "Live IPv4 host"
+    }
+
+    static func isUselessTitle(_ title: String) -> Bool {
+        let lowered = title.lowercased()
+        return lowered.contains("404")
+            || lowered.contains("403")
+            || lowered.contains("401")
+            || lowered.contains("not found")
+            || lowered.contains("unauthorized")
+            || lowered == "error"
+    }
+}
+
+enum LiveHostIdentifier {
+    private static let identityPorts: [UInt16] = [22, 80, 443, 445, 502, 554, 8080, 9100, 44818]
+
+    static func identify(ip: String, interfaceIndex: UInt32) -> LiveHostIdentity {
+        var identity = LiveHostIdentity()
+        identity.hostname = reverseName(ip)
+        identity.openPorts = TCPHostProbe.openPorts(hosts: [ip], ports: identityPorts, interfaceIndex: interfaceIndex)[ip] ?? []
+        if identity.openPorts.contains(80) {
+            let banner = httpBanner(ip: ip, port: 80, interfaceIndex: interfaceIndex)
+            identity.httpServer = banner.server
+            identity.httpTitle = banner.title
+        }
+        return identity
+    }
+
+    private static func reverseName(_ ip: String) -> String? {
+        let box = TimeoutBox<String>()
+        let group = DispatchGroup()
+        group.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            defer { group.leave() }
+            var address = sockaddr_in()
+            address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            address.sin_family = sa_family_t(AF_INET)
+            address.sin_addr.s_addr = inet_pton4(ip)
+            var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            let result = withUnsafePointer(to: &address) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                    getnameinfo(sockaddrPointer, socklen_t(MemoryLayout<sockaddr_in>.size), &hostname, socklen_t(hostname.count), nil, 0, NI_NAMEREQD)
+                }
+            }
+            guard result == 0 else { return }
+            let name = String(cString: hostname)
+            if name != ip, !name.isEmpty { box.value = name }
+        }
+        _ = group.wait(timeout: .now() + 0.45)
+        return box.value
+    }
+
+    private static func httpBanner(ip: String, port: UInt16, interfaceIndex: UInt32) -> (server: String?, title: String?) {
+        let fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+        guard fd >= 0 else { return (nil, nil) }
+        defer { close(fd) }
+        _ = fcntl(fd, F_SETFL, O_NONBLOCK)
+        if interfaceIndex != 0 {
+            var index = interfaceIndex
+            setsockopt(fd, IPPROTO_IP, IP_BOUND_IF, &index, socklen_t(MemoryLayout<UInt32>.size))
+        }
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = port.bigEndian
+        address.sin_addr.s_addr = inet_pton4(ip)
+        _ = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                connect(fd, sockaddrPointer, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        var pollFd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+        guard poll(&pollFd, 1, 500) > 0 else { return (nil, nil) }
+        var error: Int32 = 0
+        var length = socklen_t(MemoryLayout<Int32>.size)
+        _ = withUnsafeMutablePointer(to: &error) { pointer in
+            getsockopt(fd, SOL_SOCKET, SO_ERROR, pointer, &length)
+        }
+        guard error == 0 else { return (nil, nil) }
+
+        let request = "GET / HTTP/1.0\r\nHost: \(ip)\r\nUser-Agent: FieldLinkPLC\r\nConnection: close\r\n\r\n"
+        _ = request.withCString { send(fd, $0, strlen($0), 0) }
+        var timeout = timeval(tv_sec: 0, tv_usec: 600_000)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        _ = fcntl(fd, F_SETFL, 0)
+        var buffer = [UInt8](repeating: 0, count: 2048)
+        let received = recv(fd, &buffer, buffer.count, 0)
+        guard received > 0 else { return (nil, nil) }
+        let text = String(bytes: buffer.prefix(Int(received)), encoding: .isoLatin1) ?? ""
+        return (httpHeader(text, name: "Server"), htmlTitle(text))
+    }
+
+    private static func httpHeader(_ text: String, name: String) -> String? {
+        for line in text.split(whereSeparator: { $0 == "\n" }) {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            let prefix = name + ":"
+            if trimmed.lowercased().hasPrefix(prefix.lowercased()) {
+                let value = trimmed.dropFirst(prefix.count).trimmingCharacters(in: .whitespaces)
+                return value.isEmpty ? nil : value
+            }
+        }
+        return nil
+    }
+
+    private static func htmlTitle(_ text: String) -> String? {
+        guard let start = text.lowercased().range(of: "<title>"),
+              let end = text.lowercased().range(of: "</title>", range: start.upperBound..<text.endIndex) else {
+            return nil
+        }
+        let title = text[start.upperBound..<end.lowerBound]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return title.isEmpty ? nil : String(title.prefix(60))
+    }
+}
+
+private final class TimeoutBox<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Value?
+    var value: Value? {
+        get { lock.lock(); defer { lock.unlock() }; return stored }
+        set { lock.lock(); stored = newValue; lock.unlock() }
+    }
+}
+
+enum ICMPHostProbe {
+    static func liveHosts(interface: IPv4Interface, hosts: [String]) -> [String] {
+        let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)
+        guard fd >= 0 else {
+            discoveryLog.info("ICMP probe unavailable: \(String(cString: strerror(errno)), privacy: .public)")
+            return []
+        }
+        defer { close(fd) }
+
+        var interfaceIndex = if_nametoindex(interface.name)
+        if interfaceIndex != 0 {
+            setsockopt(fd, IPPROTO_IP, IP_BOUND_IF, &interfaceIndex, socklen_t(MemoryLayout<UInt32>.size))
+        }
+        var timeout = timeval(tv_sec: 0, tv_usec: 80_000)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+
+        let identifier = UInt16.random(in: 1 ... .max)
+        for (index, host) in hosts.enumerated() {
+            sendEcho(fd: fd, host: host, identifier: identifier, sequence: UInt16(truncatingIfNeeded: index))
+        }
+
+        var found = Set<String>()
+        let deadline = Date().addingTimeInterval(2.0)
+        var buffer = [UInt8](repeating: 0, count: 256)
+        while Date() < deadline {
+            var source = sockaddr_in()
+            var sourceLength = socklen_t(MemoryLayout<sockaddr_in>.size)
+            let received = withUnsafeMutablePointer(to: &source) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                    recvfrom(fd, &buffer, buffer.count, 0, sockaddrPointer, &sourceLength)
+                }
+            }
+            guard received > 0 else { continue }
+            let address = ipv4String(source)
+            if address != interface.address, address != "0.0.0.0" {
+                found.insert(address)
+            }
+        }
+        return found.sorted()
+    }
+
+    private static func sendEcho(fd: Int32, host: String, identifier: UInt16, sequence: UInt16) {
+        var packet = Data(count: 8)
+        packet[0] = 8
+        packet[1] = 0
+        packet[4] = UInt8(identifier >> 8)
+        packet[5] = UInt8(identifier & 0xff)
+        packet[6] = UInt8(sequence >> 8)
+        packet[7] = UInt8(sequence & 0xff)
+        let sum = internetChecksum(packet)
+        packet[2] = UInt8(sum >> 8)
+        packet[3] = UInt8(sum & 0xff)
+
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_addr.s_addr = inet_pton4(host)
+        _ = packet.withUnsafeBytes { buffer in
+            withUnsafePointer(to: &address) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                    sendto(fd, buffer.baseAddress, packet.count, 0, sockaddrPointer, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+        }
+    }
+}
+
+enum TCPHostProbe {
+    private static let ports: [UInt16] = [80, 443, 44818]
+
+    static func liveHosts(interface: IPv4Interface, hosts: [String]) -> [String] {
+        let interfaceIndex = if_nametoindex(interface.name)
+        var live = Set<String>()
+        let batchSize = 32
+        var start = 0
+        while start < hosts.count {
+            let end = min(start + batchSize, hosts.count)
+            live.formUnion(probe(hosts: Array(hosts[start..<end]), interfaceIndex: interfaceIndex))
+            start = end
+        }
+        return live.sorted()
+    }
+
+    static func openPorts(hosts: [String], ports: [UInt16], interfaceIndex: UInt32) -> [String: [UInt16]] {
+        connect(hosts: hosts, ports: ports, interfaceIndex: interfaceIndex, timeoutMs: 450).open
+    }
+
+    private static func probe(hosts: [String], interfaceIndex: UInt32) -> Set<String> {
+        let result = connect(hosts: hosts, ports: ports, interfaceIndex: interfaceIndex, timeoutMs: 280)
+        return Set(result.live)
+    }
+
+    private static func connect(
+        hosts: [String],
+        ports: [UInt16],
+        interfaceIndex: UInt32,
+        timeoutMs: Int32
+    ) -> (live: [String], open: [String: [UInt16]]) {
+        var sockets: [(fd: Int32, host: String, port: UInt16)] = []
+        sockets.reserveCapacity(hosts.count * ports.count)
+        for host in hosts {
+            for port in ports {
+                let fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+                guard fd >= 0 else { continue }
+                _ = fcntl(fd, F_SETFL, O_NONBLOCK)
+                if interfaceIndex != 0 {
+                    var index = interfaceIndex
+                    setsockopt(fd, IPPROTO_IP, IP_BOUND_IF, &index, socklen_t(MemoryLayout<UInt32>.size))
+                }
+                var address = sockaddr_in()
+                address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+                address.sin_family = sa_family_t(AF_INET)
+                address.sin_port = port.bigEndian
+                address.sin_addr.s_addr = inet_pton4(host)
+                _ = withUnsafePointer(to: &address) { pointer in
+                    pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                        Darwin.connect(fd, sockaddrPointer, socklen_t(MemoryLayout<sockaddr_in>.size))
+                    }
+                }
+                sockets.append((fd, host, port))
+            }
+        }
+
+        var pollFds = sockets.map { pollfd(fd: $0.fd, events: Int16(POLLOUT), revents: 0) }
+        _ = pollFds.withUnsafeMutableBufferPointer { buffer in
+            poll(buffer.baseAddress, nfds_t(buffer.count), timeoutMs)
+        }
+
+        var live = Set<String>()
+        var open: [String: [UInt16]] = [:]
+        for (index, entry) in sockets.enumerated() {
+            if pollFds[index].revents & Int16(POLLOUT | POLLERR | POLLHUP) != 0 {
+                var error: Int32 = 0
+                var length = socklen_t(MemoryLayout<Int32>.size)
+                _ = withUnsafeMutablePointer(to: &error) { pointer in
+                    getsockopt(entry.fd, SOL_SOCKET, SO_ERROR, pointer, &length)
+                }
+                if error == 0 || error == ECONNREFUSED {
+                    live.insert(entry.host)
+                }
+                if error == 0 {
+                    open[entry.host, default: []].append(entry.port)
+                }
+            }
+            close(entry.fd)
+        }
+        for key in open.keys {
+            open[key]?.sort()
+        }
+        return (Array(live), open)
+    }
+}
+
+private func isOnLink(_ host: String, interface: IPv4Interface) -> Bool {
+    let address = ipv4Value(host)
+    let local = ipv4Value(interface.address)
+    let mask = ipv4Value(interface.netmask)
+    guard mask != 0 else { return false }
+    return (address & mask) == (local & mask)
+}
+
+private func internetChecksum(_ data: Data) -> UInt16 {
+    var sum: UInt32 = 0
+    var index = 0
+    while index + 1 < data.count {
+        sum += UInt32(data[index]) << 8 | UInt32(data[index + 1])
+        index += 2
+    }
+    if index < data.count {
+        sum += UInt32(data[index]) << 8
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16)
+    }
+    return UInt16(~sum & 0xffff)
+}
+
+private func directedBroadcast(ip: String, mask: String) -> String {
+    let address = ipv4Value(ip)
+    let netmask = ipv4Value(mask)
+    guard address != 0, netmask != 0 else { return "255.255.255.255" }
+    return ipv4String(address | ~netmask)
+}
+
+private func subnetHosts(ip: String, mask: String, skipping excluded: String) -> [String] {
+    let address = ipv4Value(ip)
+    let netmask = ipv4Value(mask)
+    guard address != 0, netmask != 0 else { return [] }
+    var prefix = netmask == 0 ? 22 : netmask.nonzeroBitCount
+    if prefix < 22 { prefix = 22 }
+    guard prefix < 32 else { return [] }
+    let scanMask = UInt32.max << (32 - prefix)
+    let hostCount = (1 << (32 - prefix)) - 2
+    guard hostCount <= 1022 else { return [] }
+    let network = address & scanMask
+    let broadcast = network | ~scanMask
+    let skip = ipv4Value(excluded)
+    var hosts: [String] = []
+    var host = network + 1
+    while host < broadcast {
+        if host != address, host != skip {
+            hosts.append(ipv4String(host))
+        }
+        host += 1
+    }
+    return hosts
 }
 
 private func ipv4Value(_ address: String) -> UInt32 {

@@ -119,7 +119,7 @@ struct DiscoveryDebugView: View {
                 Button {
                     Task { await model.discoverDevices() }
                 } label: {
-                    Label(model.isWorking ? "Probing…" : "Run discovery now", systemImage: "radar")
+                    Label(model.isWorking ? "Probing…" : "Run discovery now", systemImage: "antenna.radiowaves.left.and.right")
                 }
                 .disabled(model.isWorking || !model.isGatewayReady)
 

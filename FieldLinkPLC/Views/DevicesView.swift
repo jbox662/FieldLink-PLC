@@ -23,7 +23,7 @@ struct DevicesView: View {
 
                 if model.devices.isEmpty {
                     ContentUnavailableView {
-                        Label("No devices yet", systemImage: "radar")
+                        Label("No devices yet", systemImage: "antenna.radiowaves.left.and.right")
                     } description: {
                         Text("Run Discover, then open Gateway → Discovery debug if the list stays empty.")
                     }
@@ -53,7 +53,7 @@ struct DevicesView: View {
                         if model.isWorking {
                             ProgressView()
                         } else {
-                            Label("Discover", systemImage: "radar")
+                            Label("Discover", systemImage: "antenna.radiowaves.left.and.right")
                         }
                     }
                     .disabled(model.isWorking || !model.isGatewayReady)

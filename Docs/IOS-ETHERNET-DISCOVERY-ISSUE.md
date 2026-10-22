@@ -1,5 +1,7 @@
 # FieldLink PLC — iOS USB-C Ethernet discovery cannot find a PLC
 
+> **Superseded for current work.** Use [`Docs/MANUS-DISCOVERY-STATUS.md`](MANUS-DISCOVERY-STATUS.md) (9 Oct 2026). Multicast is now approved; this file is the 5 Oct bench record only.
+
 **Date:** 5 Oct 2026  
 **App:** FieldLink PLC (`com.johnnybox.fieldlinkplc`, team `6MGV2KJVCV`)  
 **Goal:** Match [TW Controls SIM-IPE](https://twcontrols.com/plc-trainers-all/p/sim-ipe) behavior: find EtherNet/IP devices on a live Ethernet cable **without the phone being on the same IP/subnet**, then read identity.
